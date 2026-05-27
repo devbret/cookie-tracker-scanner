@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
+import ipaddress
 import json
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -51,23 +54,14 @@ def is_local_or_private_host(host: str) -> bool:
     if not host:
         return True
     h = host.lower()
-    if h in ("localhost",):
+    if h == "localhost":
         return True
     if h.endswith(".local"):
         return True
-
-    ip_like = re.match(r"^\d{1,3}(\.\d{1,3}){3}$", h)
-    if ip_like:
-        parts = [int(x) for x in h.split(".")]
-        if parts[0] == 10:
-            return True
-        if parts[0] == 127:
-            return True
-        if parts[0] == 192 and parts[1] == 168:
-            return True
-        if parts[0] == 172 and 16 <= parts[1] <= 31:
-            return True
-    return False
+    try:
+        return ipaddress.ip_address(h).is_private
+    except ValueError:
+        return False
 
 def json_dump(path: Path, obj: Any) -> None:
     path.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -141,10 +135,19 @@ def diff_cookies(before: List[Dict[str, Any]], after: List[Dict[str, Any]]) -> D
     }
 
 def top_counts(items: List[str], limit: int = 15) -> List[Tuple[str, int]]:
-    counts: Dict[str, int] = {}
-    for x in items:
-        counts[x] = counts.get(x, 0) + 1
-    return sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:limit]
+    return Counter(items).most_common(limit)
+
+def enrich_cookies(cookies: List[Dict[str, Any]], site_etld1: str) -> List[Dict[str, Any]]:
+    enriched = []
+    for c in cookies:
+        dom = (c.get("domain") or "").lstrip(".")
+        host_, r_etld1, party = classify_party(site_etld1, dom)
+        cc = dict(c)
+        cc["domain_host"] = host_
+        cc["domain_etld1"] = r_etld1
+        cc["party"] = party
+        enriched.append(cc)
+    return enriched
 
 REJECT_PATTERNS = [
     r"\breject\b", r"\bdecline\b", r"\bdeny\b", r"\bopt[- ]?out\b", r"\bdo not accept\b",
@@ -264,12 +267,22 @@ class ScanConfig:
     max_events: int
     block_media: bool
     user_agent: Optional[str]
-    viewport: str  
+    viewport: str
     actions: List[str]
-    consent: str 
+    consent: str
     reject_selector: Optional[str]
     accept_selector: Optional[str]
     report: bool
+
+@dataclass
+class _BrowserSession:
+    browser: Any
+    context: Any
+    page: Any
+    requests_log: List[Dict[str, Any]]
+    responses_log: List[Dict[str, Any]]
+    set_cookie_events: List[Dict[str, Any]]
+    current_phase: Dict[str, str]
 
 def viewport_settings(kind: str) -> Dict[str, Any]:
     if kind == "mobile":
@@ -329,91 +342,91 @@ def write_report_html(out_path: Path, summary: Dict[str, Any], domains: Dict[str
     tp = domains.get("third_party", {}).get("top_by_requests", [])
     cookie_counts = cookies_delta.get("counts", {})
 
-    rows = "".join([f"<tr><td>{d}</td><td style='text-align:right'>{c}</td></tr>" for d, c in tp[:20]]) or \
-           "<tr><td colspan='2'>(none detected)</td></tr>"
+    def e(v: Any) -> str:
+        return html.escape(str(v)) if v is not None else ""
 
-    html = f"""<!doctype html>
-    <html>
-    <head>
-    <meta charset="utf-8"/>
-    <title>Tracking Surface Report</title>
-    <style>
-        body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }}
-        .card {{ border: 1px solid #ddd; border-radius: 12px; padding: 16px; margin-bottom: 16px; }}
-        table {{ border-collapse: collapse; width: 100%; }}
-        td, th {{ border-bottom: 1px solid #eee; padding: 8px; }}
-        th {{ text-align: left; }}
-        code {{ background: #f6f6f6; padding: 2px 6px; border-radius: 6px; }}
-    </style>
-    </head>
-    <body>
-    <h1>Tracking Surface Report</h1>
+    rows = "".join(
+        f"<tr><td>{e(d)}</td><td style='text-align:right'>{e(c)}</td></tr>"
+        for d, c in tp[:20]
+    ) or "<tr><td colspan='2'>(none detected)</td></tr>"
 
-    <div class="card">
-        <div><b>URL:</b> {summary.get('scanned_url')}</div>
-        <div><b>Scenario:</b> {summary.get('scenario')}</div>
-        <div><b>Viewport:</b> {summary.get('viewport')}</div>
-        <div><b>Timestamp:</b> {summary.get('timestamp')}</div>
-        <div><b>Final URL:</b> {summary.get('final_url')}</div>
-    </div>
+    artifact_items = "".join(
+        f"<li>{e(k)}: <code>{e(v)}</code></li>"
+        for k, v in (summary.get("artifacts") or {}).items()
+    )
 
-    <div class="card">
-        <h2>Totals</h2>
-        <ul>
-        <li>Requests: <b>{summary.get('requests_total')}</b></li>
-        <li>Responses: <b>{summary.get('responses_total')}</b></li>
-        <li>Script tags: <b>{summary.get('script_tags_total')}</b></li>
-        <li>Iframe tags: <b>{summary.get('iframe_tags_total')}</b></li>
-        <li>Cookies (before): <b>{summary.get('cookies_before_total')}</b></li>
-        <li>Cookies (after actions): <b>{summary.get('cookies_after_actions_total')}</b></li>
-        </ul>
-    </div>
+    html_out = f"""<!doctype html>
+                <html>
+                <head>
+                <meta charset="utf-8"/>
+                <title>Tracking Surface Report</title>
+                <style>
+                    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }}
+                    .card {{ border: 1px solid #ddd; border-radius: 12px; padding: 16px; margin-bottom: 16px; }}
+                    table {{ border-collapse: collapse; width: 100%; }}
+                    td, th {{ border-bottom: 1px solid #eee; padding: 8px; }}
+                    th {{ text-align: left; }}
+                    code {{ background: #f6f6f6; padding: 2px 6px; border-radius: 6px; }}
+                </style>
+                </head>
+                <body>
+                <h1>Tracking Surface Report</h1>
 
-    <div class="card">
-        <h2>Cookie Changes</h2>
-        <ul>
-        <li>Added: <b>{cookie_counts.get('added', 0)}</b></li>
-        <li>Removed: <b>{cookie_counts.get('removed', 0)}</b></li>
-        <li>Changed: <b>{cookie_counts.get('changed', 0)}</b></li>
-        </ul>
-    </div>
+                <div class="card">
+                    <div><b>URL:</b> {e(summary.get('scanned_url'))}</div>
+                    <div><b>Scenario:</b> {e(summary.get('scenario'))}</div>
+                    <div><b>Viewport:</b> {e(summary.get('viewport'))}</div>
+                    <div><b>Timestamp:</b> {e(summary.get('timestamp'))}</div>
+                    <div><b>Final URL:</b> {e(summary.get('final_url'))}</div>
+                </div>
 
-    <div class="card">
-        <h2>Top Third-Party Domains (by request count)</h2>
-        <table>
-        <thead><tr><th>Domain</th><th style="text-align:right">Requests</th></tr></thead>
-        <tbody>{rows}</tbody>
-        </table>
-    </div>
+                <div class="card">
+                    <h2>Totals</h2>
+                    <ul>
+                    <li>Requests: <b>{e(summary.get('requests_total'))}</b></li>
+                    <li>Responses: <b>{e(summary.get('responses_total'))}</b></li>
+                    <li>Script tags: <b>{e(summary.get('script_tags_total'))}</b></li>
+                    <li>Iframe tags: <b>{e(summary.get('iframe_tags_total'))}</b></li>
+                    <li>Cookies (before): <b>{e(summary.get('cookies_before_total'))}</b></li>
+                    <li>Cookies (after actions): <b>{e(summary.get('cookies_after_actions_total'))}</b></li>
+                    </ul>
+                </div>
 
-    <div class="card">
-        <h2>Artifacts</h2>
-        <ul>
-        {''.join([f"<li>{k}: <code>{v}</code></li>" for k, v in (summary.get('artifacts', {}) or {}).items()])}
-        </ul>
-    </div>
+                <div class="card">
+                    <h2>Cookie Changes</h2>
+                    <ul>
+                    <li>Added: <b>{e(cookie_counts.get('added', 0))}</b></li>
+                    <li>Removed: <b>{e(cookie_counts.get('removed', 0))}</b></li>
+                    <li>Changed: <b>{e(cookie_counts.get('changed', 0))}</b></li>
+                    </ul>
+                </div>
 
-    <div class="card">
-        <h2>Screenshot</h2>
-        <div><img src="screenshot.png" style="max-width:100%; border:1px solid #eee; border-radius:12px;"></div>
-    </div>
-    </body>
-    </html>
-    """
-    (out_path / "report.html").write_text(html, encoding="utf-8")
+                <div class="card">
+                    <h2>Top Third-Party Domains (by request count)</h2>
+                    <table>
+                    <thead><tr><th>Domain</th><th style="text-align:right">Requests</th></tr></thead>
+                    <tbody>{rows}</tbody>
+                    </table>
+                </div>
 
-def run_single_scan(
-    pw,
-    cfg: ScanConfig,
-    out_path: Path,
-    scenario_name: str,
-) -> Dict[str, Any]:
-    scan_start = time.time()
+                <div class="card">
+                    <h2>Artifacts</h2>
+                    <ul>{artifact_items}</ul>
+                </div>
 
+                <div class="card">
+                    <h2>Screenshot</h2>
+                    <div><img src="screenshot.png" style="max-width:100%; border:1px solid #eee; border-radius:12px;"></div>
+                </div>
+                </body>
+                </html>
+                """
+    (out_path / "report.html").write_text(html_out, encoding="utf-8")
+
+def _setup_browser(pw, cfg: ScanConfig, out_path: Path, site_etld1: str) -> _BrowserSession:
     requests_log: List[Dict[str, Any]] = []
     responses_log: List[Dict[str, Any]] = []
     set_cookie_events: List[Dict[str, Any]] = []
-
     current_phase = {"name": "baseline"}
     event_count = {"n": 0}
 
@@ -422,7 +435,6 @@ def run_single_scan(
     ctx_kwargs: Dict[str, Any] = {}
     if cfg.user_agent:
         ctx_kwargs["user_agent"] = cfg.user_agent
-
     ctx_kwargs.update(viewport_settings(cfg.viewport))
 
     har_path = out_path / "scan.har"
@@ -437,9 +449,6 @@ def run_single_scan(
 
     page = context.new_page()
     context.tracing.start(screenshots=True, snapshots=True, sources=False)
-
-    scanned_host = host_of(cfg.url)
-    site_etld1 = registrable(scanned_host)
 
     def log_request(req: Request) -> None:
         try:
@@ -494,18 +503,19 @@ def run_single_scan(
                 "post_data_bytes": len(post_data.encode("utf-8", errors="ignore")) if post_data else 0,
                 "redirect_chain": redirect_chain,
             })
-        except Exception as e:
+        except Exception as ex:
             requests_log.append({
                 "phase": current_phase["name"],
                 "ts_ms": int(time.time() * 1000),
                 "url": getattr(req, "url", None),
-                "error": f"log_request_failed: {repr(e)}",
+                "error": f"log_request_failed: {repr(ex)}",
             })
 
     def log_response(res: Response) -> None:
         try:
-            if len(responses_log) >= cfg.max_events:
+            if event_count["n"] >= cfg.max_events:
                 return
+            event_count["n"] += 1
 
             req = res.request
             headers = res.headers
@@ -542,7 +552,7 @@ def run_single_scan(
                 "etld1": r_etld1,
                 "party": party,
                 "status": res.status,
-                "status_text": res.status_text, 
+                "status_text": res.status_text,
                 "request_url": req.url,
                 "method": req.method,
                 "resource_type": req.resource_type,
@@ -550,66 +560,37 @@ def run_single_scan(
                 "headers": headers,
                 "content_type": content_type,
             })
-        except Exception as e:
+        except Exception as ex:
             responses_log.append({
                 "phase": current_phase["name"],
                 "ts_ms": int(time.time() * 1000),
                 "url": getattr(res, "url", None),
-                "error": f"log_response_failed: {repr(e)}",
+                "error": f"log_response_failed: {repr(ex)}",
             })
 
     page.on("request", log_request)
     page.on("response", log_response)
 
-    cookies_before = context.cookies()
-    nav_ok = True
-    nav_error = None
+    return _BrowserSession(
+        browser=browser,
+        context=context,
+        page=page,
+        requests_log=requests_log,
+        responses_log=responses_log,
+        set_cookie_events=set_cookie_events,
+        current_phase=current_phase,
+    )
 
-    final_url = None
+def _navigate(page, cfg: ScanConfig) -> Tuple[bool, Optional[str], str]:
     try:
         page.goto(cfg.url, wait_until=cfg.wait_until, timeout=cfg.timeout_ms)
-        final_url = page.url
-    except PWTimeoutError as e:
-        nav_ok = False
-        nav_error = f"Timeout: {e}"
-        final_url = page.url
-    except Exception as e:
-        nav_ok = False
-        nav_error = f"Error: {e}"
-        final_url = page.url
+        return True, None, page.url
+    except PWTimeoutError as ex:
+        return False, f"Timeout: {ex}", page.url
+    except Exception as ex:
+        return False, f"Error: {ex}", page.url
 
-    cookies_after_nav = context.cookies()
-
-    consent_result = {"attempted": False}
-    if cfg.consent in ("try", "reject", "accept"):
-        mode = "reject" if cfg.consent == "reject" else "accept" if cfg.consent == "accept" else "reject"
-        if cfg.consent == "try":
-            r1 = try_click_consent(page, "reject", cfg.reject_selector, cfg.accept_selector)
-            if not r1.get("clicked"):
-                r2 = try_click_consent(page, "accept", cfg.reject_selector, cfg.accept_selector)
-                consent_result = {"attempted": True, "sequence": [r1, r2]}
-            else:
-                consent_result = {"attempted": True, "sequence": [r1]}
-        else:
-            consent_result = try_click_consent(page, mode, cfg.reject_selector, cfg.accept_selector)
-
-        page.wait_for_timeout(800)
-
-    if cfg.settle_ms > 0:
-        try:
-            page.wait_for_timeout(cfg.settle_ms)
-        except Exception:
-            pass
-
-    cookies_after_settle = context.cookies()
-
-    screenshot_path = out_path / "screenshot.png"
-    try:
-        page.screenshot(path=str(screenshot_path), full_page=True)
-    except Exception:
-        pass
-
-    scripts: List[Dict[str, Any]] = []
+def _collect_scripts(page, site_etld1: str) -> List[Dict[str, Any]]:
     try:
         scripts = page.evaluate(
             """() => Array.from(document.scripts).map(s => ({
@@ -624,7 +605,7 @@ def run_single_scan(
             }))"""
         )
     except Exception:
-        scripts = []
+        return []
 
     for s in scripts:
         if s.get("inline") and s.get("textSample") is not None:
@@ -639,8 +620,9 @@ def run_single_scan(
             s["host"] = None
             s["etld1"] = None
             s["party"] = "first"
+    return scripts
 
-    iframes: List[Dict[str, Any]] = []
+def _collect_iframes(page, site_etld1: str) -> List[Dict[str, Any]]:
     try:
         iframes = page.evaluate(
             """() => Array.from(document.querySelectorAll("iframe")).map(f => ({
@@ -651,7 +633,7 @@ def run_single_scan(
             }))"""
         )
     except Exception:
-        iframes = []
+        return []
 
     for fr in iframes:
         if fr.get("src"):
@@ -664,6 +646,45 @@ def run_single_scan(
             fr["host"] = None
             fr["etld1"] = None
             fr["party"] = "first"
+    return iframes
+
+def _post_nav_collect(
+    page,
+    context,
+    cfg: ScanConfig,
+    current_phase: Dict[str, str],
+    site_etld1: str,
+    screenshot_path: Path,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
+    consent_result: Dict[str, Any] = {"attempted": False}
+    if cfg.consent in ("try", "reject", "accept"):
+        mode = "accept" if cfg.consent == "accept" else "reject"
+        if cfg.consent == "try":
+            r1 = try_click_consent(page, "reject", cfg.reject_selector, cfg.accept_selector)
+            if not r1.get("clicked"):
+                r2 = try_click_consent(page, "accept", cfg.reject_selector, cfg.accept_selector)
+                consent_result = {"attempted": True, "sequence": [r1, r2]}
+            else:
+                consent_result = {"attempted": True, "sequence": [r1]}
+        else:
+            consent_result = try_click_consent(page, mode, cfg.reject_selector, cfg.accept_selector)
+        page.wait_for_timeout(800)
+
+    if cfg.settle_ms > 0:
+        try:
+            page.wait_for_timeout(cfg.settle_ms)
+        except Exception:
+            pass
+
+    cookies_after_settle = context.cookies()
+
+    try:
+        page.screenshot(path=str(screenshot_path), full_page=True)
+    except Exception:
+        pass
+
+    scripts = _collect_scripts(page, site_etld1)
+    iframes = _collect_iframes(page, site_etld1)
 
     action_results: List[Dict[str, Any]] = []
     cookies_after_actions = cookies_after_settle
@@ -673,28 +694,83 @@ def run_single_scan(
         action_results = perform_actions(page, actions)
         page.wait_for_timeout(800)
         cookies_after_actions = context.cookies()
-
         try:
             page.screenshot(path=str(screenshot_path), full_page=True)
         except Exception:
             pass
 
-    def enrich_cookies(cookies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        enriched = []
-        for c in cookies:
-            dom = (c.get("domain") or "").lstrip(".")
-            host_, r_etld1, party = classify_party(site_etld1, dom)
-            cc = dict(c)
-            cc["domain_host"] = host_
-            cc["domain_etld1"] = r_etld1
-            cc["party"] = party
-            enriched.append(cc)
-        return enriched
+    return cookies_after_settle, cookies_after_actions, scripts, iframes, consent_result, action_results
 
-    cookies_before_e = enrich_cookies(cookies_before)
-    cookies_after_nav_e = enrich_cookies(cookies_after_nav)
-    cookies_after_settle_e = enrich_cookies(cookies_after_settle)
-    cookies_after_actions_e = enrich_cookies(cookies_after_actions)
+def _write_scan_artifacts(
+    out_path: Path,
+    summary: Dict[str, Any],
+    requests_log: List[Dict[str, Any]],
+    responses_log: List[Dict[str, Any]],
+    set_cookie_events: List[Dict[str, Any]],
+    cookies_before_e: List[Dict[str, Any]],
+    cookies_after_nav_e: List[Dict[str, Any]],
+    cookies_after_settle_e: List[Dict[str, Any]],
+    cookies_after_actions_e: List[Dict[str, Any]],
+    cookie_deltas: Dict[str, Any],
+    scripts: List[Dict[str, Any]],
+    iframes: List[Dict[str, Any]],
+    domains: Dict[str, Any],
+    cfg: ScanConfig,
+) -> None:
+    json_dump(out_path / "summary.json", summary)
+    json_dump(out_path / "requests.json", requests_log)
+    json_dump(out_path / "responses.json", responses_log)
+    json_dump(out_path / "set_cookie_events.json", set_cookie_events)
+    json_dump(out_path / "cookies_before.json", cookies_before_e)
+    json_dump(out_path / "cookies_after_nav.json", cookies_after_nav_e)
+    json_dump(out_path / "cookies_after_settle.json", cookies_after_settle_e)
+    json_dump(out_path / "cookies_after_actions.json", cookies_after_actions_e)
+    json_dump(out_path / "cookie_deltas.json", cookie_deltas)
+    json_dump(out_path / "scripts.json", scripts)
+    json_dump(out_path / "iframes.json", iframes)
+    json_dump(out_path / "domains.json", domains)
+
+    if cfg.report:
+        report_delta = cookie_deltas.get("before_to_after_actions", {})
+        write_report_md(out_path, summary, domains, report_delta)
+        write_report_html(out_path, summary, domains, report_delta)
+
+def run_single_scan(
+    pw,
+    cfg: ScanConfig,
+    out_path: Path,
+    scenario_name: str,
+) -> Dict[str, Any]:
+    scan_start = time.time()
+
+    scanned_host = host_of(cfg.url)
+    site_etld1 = registrable(scanned_host)
+    screenshot_path = out_path / "screenshot.png"
+
+    session = _setup_browser(pw, cfg, out_path, site_etld1)
+
+    cookies_before = session.context.cookies()
+    nav_ok, nav_error, final_url = _navigate(session.page, cfg)
+    cookies_after_nav = session.context.cookies()
+
+    cookies_after_settle, cookies_after_actions, scripts, iframes, consent_result, action_results = (
+        _post_nav_collect(
+            session.page, session.context, cfg, session.current_phase,
+            site_etld1, screenshot_path,
+        )
+    )
+
+    trace_path = out_path / "trace.zip"
+    session.context.tracing.stop(path=str(trace_path))
+    session.context.close()
+    session.browser.close()
+
+    duration_ms = int((time.time() - scan_start) * 1000)
+
+    cookies_before_e = enrich_cookies(cookies_before, site_etld1)
+    cookies_after_nav_e = enrich_cookies(cookies_after_nav, site_etld1)
+    cookies_after_settle_e = enrich_cookies(cookies_after_settle, site_etld1)
+    cookies_after_actions_e = enrich_cookies(cookies_after_actions, site_etld1)
 
     cookie_deltas = {
         "before_to_after_nav": diff_cookies(cookies_before_e, cookies_after_nav_e),
@@ -703,32 +779,23 @@ def run_single_scan(
         "before_to_after_actions": diff_cookies(cookies_before_e, cookies_after_actions_e),
     }
 
-    request_hosts = [r.get("host") for r in requests_log if r.get("host")]
-    request_etld1s = [r.get("etld1") for r in requests_log if r.get("etld1")]
-    tp_etld1s = [r.get("etld1") for r in requests_log if r.get("party") == "third" and r.get("etld1")]
+    request_etld1s = [r.get("etld1") for r in session.requests_log if r.get("etld1")]
+    tp_etld1s = [r.get("etld1") for r in session.requests_log if r.get("party") == "third" and r.get("etld1")]
 
     top_tp = top_counts(tp_etld1s, limit=25)
     top_all = top_counts([x for x in request_etld1s if x], limit=25)
 
-    domains = {
+    domains_data = {
         "site": {"host": scanned_host, "etld1": site_etld1},
         "all": {
-            "unique_etld1": sorted(set([x for x in request_etld1s if x])),
+            "unique_etld1": sorted(set(x for x in request_etld1s if x)),
             "top_by_requests": top_all,
         },
         "third_party": {
-            "unique_etld1": sorted(set([x for x in tp_etld1s if x])),
+            "unique_etld1": sorted(set(x for x in tp_etld1s if x)),
             "top_by_requests": top_tp,
         }
     }
-
-    trace_path = out_path / "trace.zip"
-    context.tracing.stop(path=str(trace_path))
-
-    context.close()
-    browser.close()
-
-    duration_ms = int((time.time() - scan_start) * 1000)
 
     summary = {
         "scanned_url": cfg.url,
@@ -739,13 +806,13 @@ def run_single_scan(
         "duration_ms": duration_ms,
         "scenario": scenario_name,
         "viewport": cfg.viewport,
-        "requests_total": len(requests_log),
-        "responses_total": len(responses_log),
+        "requests_total": len(session.requests_log),
+        "responses_total": len(session.responses_log),
         "cookies_before_total": len(cookies_before_e),
         "cookies_after_actions_total": len(cookies_after_actions_e),
         "script_tags_total": len(scripts),
         "iframe_tags_total": len(iframes),
-        "third_party_request_domains": len(domains["third_party"]["unique_etld1"]),
+        "third_party_request_domains": len(domains_data["third_party"]["unique_etld1"]),
         "consent_result": consent_result,
         "actions": action_results,
         "artifacts": {
@@ -770,25 +837,12 @@ def run_single_scan(
         "config": asdict(cfg),
     }
 
-    json_dump(out_path / "summary.json", summary)
-    json_dump(out_path / "requests.json", requests_log)
-    json_dump(out_path / "responses.json", responses_log)
-    json_dump(out_path / "set_cookie_events.json", set_cookie_events)
-
-    json_dump(out_path / "cookies_before.json", cookies_before_e)
-    json_dump(out_path / "cookies_after_nav.json", cookies_after_nav_e)
-    json_dump(out_path / "cookies_after_settle.json", cookies_after_settle_e)
-    json_dump(out_path / "cookies_after_actions.json", cookies_after_actions_e)
-    json_dump(out_path / "cookie_deltas.json", cookie_deltas)
-
-    json_dump(out_path / "scripts.json", scripts)
-    json_dump(out_path / "iframes.json", iframes)
-    json_dump(out_path / "domains.json", domains)
-
-    if cfg.report:
-        report_delta = cookie_deltas.get("before_to_after_actions", {})
-        write_report_md(out_path, summary, domains, report_delta)
-        write_report_html(out_path, summary, domains, report_delta)
+    _write_scan_artifacts(
+        out_path, summary,
+        session.requests_log, session.responses_log, session.set_cookie_events,
+        cookies_before_e, cookies_after_nav_e, cookies_after_settle_e, cookies_after_actions_e,
+        cookie_deltas, scripts, iframes, domains_data, cfg,
+    )
 
     return summary
 
@@ -832,6 +886,11 @@ def main():
     ap.add_argument("--no-report", action="store_true", help="Disable report.md/report.html generation")
 
     args = ap.parse_args()
+
+    try:
+        parse_actions(args.action or [])
+    except ValueError as exc:
+        ap.error(str(exc))
 
     url = ensure_scheme(args.url)
     host = host_of(url)
@@ -912,8 +971,8 @@ def main():
                             "accept_minus_reject": sorted(ck_acc - ck_rej),
                         }
                     }
-                except Exception as e:
-                    consent_compare_output[viewport] = {"error": repr(e)}
+                except Exception as ex:
+                    consent_compare_output[viewport] = {"error": repr(ex)}
 
     json_dump(out_root / "runs_summary.json", {"runs": all_run_summaries})
 
