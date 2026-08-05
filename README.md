@@ -18,7 +18,7 @@ Below are the required software programs and instructions for installing and usi
 
 - [Python](https://www.python.org/downloads/)
 
-### Steps For Use
+### Setup Steps
 
 1. Install the above programs
 
@@ -42,12 +42,24 @@ Below are the required software programs and instructions for installing and usi
 
 ## Other Considerations
 
+This section covers supplementary information about the repo outside of core setup and usage instructions. It begins by outlining specific abilities this repo is intended to demonstrate. It then closes with the project's license information, along with details on how to get in touch for questions or potential collaboration.
+
+### Abilities Demonstrated
+
 This project repo is intended to demonstrate an ability to do the following:
 
-- Scan a website with Playwright to measure its tracking surface
+- Automate a Chromium browser via Playwright to visit a single website and observe its behavior in real time
 
-- Capture cookie behavior before and after page navigation, consent interactions, settling time and user actions
+- Record the full network activity of a page load by capturing requests, resource types, headers and redirects
 
-- Save scan screenshots, JSON summaries and Markdown reports for later analysis
+- Classify tracking activity as either first-party or third-party to reveal a website's data-sharing footprint
+
+- Detect cookie changes across navigation, consent interactions and settling
+
+- Output findings as structured, shareable files including JSON logs plus optional Markdown and HTML reports
+
+### License Information
+
+This project is licensed under a [MIT License](LICENSE), which is a permissive open-source license allowing anyone to use, modify, publish and/or sell copies of the software with minimal restrictions. The only requirement is the original copyright notice and permission notice be included in all copies or substantial portions of the software. The software is provided "as is", without warranty of any kind, so use it at your own risk.
 
 If you have any questions or would like to collaborate, please reach out either on GitHub or via [my website](https://bretbernhoft.com/).
