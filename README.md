@@ -34,11 +34,13 @@ Below are the required software programs and instructions for installing and usi
 
 7. Install the needed dependencies: `pip install -r requirements.txt`
 
-8. Run the program: `python3 app.py example.com`
+8. Download the Chromium browser used by Playwright: `playwright install chromium`
 
-9. Locate your output results in the `scans` directory
+9. Run the program: `python3 app.py example.com`
 
-10. Exit the virtual environment: `deactivate`
+10. Locate your output results in the `scans` directory
+
+11. Exit the virtual environment: `deactivate`
 
 ## Other Considerations
 
