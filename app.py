@@ -45,8 +45,8 @@ def now_ts() -> int:
     return int(time.time())
 
 def etld1(host: str) -> str:
-    ext = tldextract.extract(host)
-    if not ext.suffix:
+    ext = tldextract.extract(host, include_psl_private_domains=True)
+    if not ext.suffix or not ext.domain:
         return host
     return f"{ext.domain}.{ext.suffix}"
 
@@ -150,12 +150,16 @@ def enrich_cookies(cookies: List[Dict[str, Any]], site_etld1: str) -> List[Dict[
     return enriched
 
 REJECT_PATTERNS = [
-    r"\breject\b", r"\bdecline\b", r"\bdeny\b", r"\bopt[- ]?out\b", r"\bdo not accept\b",
-    r"\brefuse\b", r"\bonly necessary\b", r"\bnecessary only\b"
+    r"\breject all\b", r"\breject\b", r"\bdecline\b", r"\bdeny\b", r"\brefuse\b",
+    r"\bdo not accept\b", r"\bonly necessary\b", r"\bnecessary only\b", r"\bopt[- ]?out\b"
 ]
 ACCEPT_PATTERNS = [
-    r"\baccept\b", r"\bagree\b", r"\ballow\b", r"\bok\b", r"\bi understand\b", r"\bgot it\b",
-    r"\baccept all\b", r"\ballow all\b"
+    r"\baccept all\b", r"\ballow all\b", r"\baccept\b", r"\bagree\b", r"\ballow\b",
+    r"\bgot it\b", r"\bi understand\b", r"\bok\b"
+]
+ACCEPT_EXCLUDE_PATTERNS = REJECT_PATTERNS + [
+    r"\bnecessary\b", r"\bessential\b", r"\brequired\b", r"\bselection\b",
+    r"\bmanage\b", r"\bsettings\b", r"\bpreferences\b", r"\bcustomi[sz]e\b", r"\boptions\b"
 ]
 
 def try_click_consent(page, mode: str, reject_selector: Optional[str], accept_selector: Optional[str]) -> Dict[str, Any]:
@@ -175,27 +179,33 @@ def try_click_consent(page, mode: str, reject_selector: Optional[str], accept_se
                 result.update({"clicked": True, "method": "selector", "selector": accept_selector})
                 return result
 
-        patterns = REJECT_PATTERNS if mode == "reject" else ACCEPT_PATTERNS
-        regex = re.compile("|".join(patterns), re.I)
+        patterns =[re.compile(p, re.I) for p in (REJECT_PATTERNS if mode == "reject" else ACCEPT_PATTERNS)]
+        exclude = re.compile("|".join(ACCEPT_EXCLUDE_PATTERNS), re.I) if mode == "accept" else None
 
-        btn = page.get_by_role("button", name=regex)
-        if btn.count() > 0:
-            btn.first.click(timeout=3000)
-            result.update({"clicked": True, "method": "role_button_regex"})
-            return result
+        for regex in patterns:
+            btn = page.get_by_role("button", name=regex)
+            if exclude:
+                btn = btn.filter(has_not_text=exclude)
+            if btn.count() > 0:
+                btn.first.click(timeout=3000)
+                result.update({"clicked": True, "method": "role_button_regex", "pattern": regex.pattern})
+                return result
 
         candidates = page.locator("button, [role='button'], a, input[type='button'], input[type='submit']")
         n = candidates.count()
+        texts: List[str] = []
         for i in range(min(n, 50)):
-            el = candidates.nth(i)
             try:
-                txt = (el.inner_text(timeout=200) or "").strip()
+                texts.append((candidates.nth(i).inner_text(timeout=200) or "").strip())
             except Exception:
-                txt = ""
-            if txt and regex.search(txt):
-                el.click(timeout=3000)
-                result.update({"clicked": True, "method": "text_scan"})
-                return result
+                texts.append("")
+
+        for regex in patterns:
+            for i, txt in enumerate(texts):
+                if txt and regex.search(txt) and not (exclude and exclude.search(txt)):
+                    candidates.nth(i).click(timeout=3000)
+                    result.update({"clicked": True, "method": "text_scan", "pattern": regex.pattern, "label": txt})
+                    return result
 
         result["method"] = "not_found"
         return result
@@ -212,7 +222,10 @@ def parse_actions(action_args: List[str]) -> List[Tuple[str, Optional[str]]]:
         if a == "scroll":
             actions.append(("scroll", None))
         elif a.startswith("idle:"):
-            actions.append(("idle", a.split(":", 1)[1]))
+            ms = a.split(":", 1)[1].strip()
+            if not (ms.isascii() and ms.isdigit()):
+                raise ValueError(f"Invalid idle duration (expected milliseconds): {a}")
+            actions.append(("idle", ms))
         elif a.startswith("click:"):
             actions.append(("click", a.split(":", 1)[1]))
         else:
@@ -456,7 +469,6 @@ def _setup_browser(pw, cfg: ScanConfig, out_path: Path, site_etld1: str) -> _Bro
                 return
             event_count["n"] += 1
 
-            post_data = req.post_data or ""
             try:
                 frame_url = req.frame.url if req.frame else None
             except Exception:
@@ -500,7 +512,7 @@ def _setup_browser(pw, cfg: ScanConfig, out_path: Path, site_etld1: str) -> _Bro
                 "frame_url": frame_url,
                 "referer": referer,
                 "headers": req.headers,
-                "post_data_bytes": len(post_data.encode("utf-8", errors="ignore")) if post_data else 0,
+                "post_data_bytes": len(req.post_data_buffer or b""),
                 "redirect_chain": redirect_chain,
             })
         except Exception as ex:
@@ -520,12 +532,11 @@ def _setup_browser(pw, cfg: ScanConfig, out_path: Path, site_etld1: str) -> _Bro
             req = res.request
             headers = res.headers
 
-            set_cookie = None
-            for k, v in headers.items():
-                if k.lower() == "set-cookie":
-                    set_cookie = v
-                    break
-            if set_cookie:
+            try:
+                set_cookies = res.header_values("set-cookie")
+            except Exception:
+                set_cookies = []
+            for set_cookie in set_cookies:
                 set_cookie_events.append({
                     "phase": current_phase["name"],
                     "ts_ms": int(time.time() * 1000),
@@ -580,6 +591,18 @@ def _setup_browser(pw, cfg: ScanConfig, out_path: Path, site_etld1: str) -> _Bro
         set_cookie_events=set_cookie_events,
         current_phase=current_phase,
     )
+
+def _close_session(session: _BrowserSession, trace_path: Path) -> None:
+    steps = [
+        ("tracing.stop", lambda: session.context.tracing.stop(path=str(trace_path))),
+        ("context.close", session.context.close),
+        ("browser.close", session.browser.close),
+    ]
+    for name, step in steps:
+        try:
+            step()
+        except Exception as ex:
+            console.print(f"[yellow]Cleanup step {name} failed:[/yellow] {ex!r}")
 
 def _navigate(page, cfg: ScanConfig) -> Tuple[bool, Optional[str], str]:
     try:
@@ -749,21 +772,19 @@ def run_single_scan(
 
     session = _setup_browser(pw, cfg, out_path, site_etld1)
 
-    cookies_before = session.context.cookies()
-    nav_ok, nav_error, final_url = _navigate(session.page, cfg)
-    cookies_after_nav = session.context.cookies()
+    try:
+        cookies_before = session.context.cookies()
+        nav_ok, nav_error, final_url = _navigate(session.page, cfg)
+        cookies_after_nav = session.context.cookies()
 
-    cookies_after_settle, cookies_after_actions, scripts, iframes, consent_result, action_results = (
-        _post_nav_collect(
-            session.page, session.context, cfg, session.current_phase,
-            site_etld1, screenshot_path,
+        cookies_after_settle, cookies_after_actions, scripts, iframes, consent_result, action_results = (
+            _post_nav_collect(
+                session.page, session.context, cfg, session.current_phase,
+                site_etld1, screenshot_path,
+            )
         )
-    )
-
-    trace_path = out_path / "trace.zip"
-    session.context.tracing.stop(path=str(trace_path))
-    session.context.close()
-    session.browser.close()
+    finally:
+        _close_session(session, out_path / "trace.zip")
 
     duration_ms = int((time.time() - scan_start) * 1000)
 
@@ -929,6 +950,7 @@ def main():
 
     all_run_summaries: List[Dict[str, Any]] = []
     consent_compare_output: Dict[str, Any] = {}
+    failed_runs = 0
 
     with sync_playwright() as pw:
         for viewport in viewports:
@@ -943,8 +965,20 @@ def main():
                     viewport=viewport,
                     consent=consent_mode,
                 )
-                summary = run_single_scan(pw, cfg, scenario_out, scenario_name)
-                summarize_console(summary)
+                try:
+                    summary = run_single_scan(pw, cfg, scenario_out, scenario_name)
+                    summarize_console(summary)
+                except Exception as ex:
+                    console.print(f"[red]Scan failed ({scenario_name}, {viewport}):[/red] {ex!r}")
+                    summary = {
+                        "scanned_url": url,
+                        "scenario": scenario_name,
+                        "viewport": viewport,
+                        "error": repr(ex),
+                        "config": asdict(cfg),
+                    }
+                    json_dump(scenario_out / "summary.json", summary)
+                    failed_runs += 1
                 all_run_summaries.append(summary)
 
             if args.consent == "compare":
@@ -980,6 +1014,8 @@ def main():
         json_dump(out_root / "consent_comparison.json", consent_compare_output)
         console.print(f"[green]Wrote[/green] {out_root / 'consent_comparison.json'}")
 
+    if failed_runs:
+        raise SystemExit(f"Done, but {failed_runs} scan(s) failed; see summary.json in each failed scenario folder.")
     console.print("[green]Done.[/green]")
 
 if __name__ == "__main__":
